@@ -27,7 +27,7 @@ html5lib
 lxml
 
 ## Data Storage
-sqlite3
+sqlite
 pickle-mixin
 python-json-logger
 
