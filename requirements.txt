@@ -6,9 +6,10 @@ pandas
 plotly
 numpy
 
-# PDF/DOCX Processing
+# PDF/DOCX/Excel Processing
 PyPDF2
 python-docx
+openpyxl
 
 # AI & LangChain
 langchain
