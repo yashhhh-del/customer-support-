@@ -1,978 +1,1066 @@
-"""
-Customer Support & FAQ AI Agent System
-=====================================
-A complete AI-powered support system with:
-- Website Chat Widget
-- WhatsApp Integration
-- Email Auto-Responder
-- Ticketing System
-- Multilingual Support
-- Analytics Dashboard
-"""
-
-# ============================================================================
-# CONFIGURATION AND SETTINGS
-# ============================================================================
-
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+import uuid
+import time
 import os
 import json
-import datetime
-import pytz
-from typing import Dict, List, Optional, Any, Tuple
-from dataclasses import dataclass
-from enum import Enum
-import logging
+import sqlite3
+from typing import List, Dict, Optional, Tuple
+import re
+from io import BytesIO
+import base64
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# For PDF/DOCX processing
+try:
+    import PyPDF2
+    from docx import Document
+except ImportError:
+    st.warning("Please install: pip install PyPDF2 python-docx")
 
-@dataclass
-class Config:
-    """System configuration"""
-    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-    FAISS_INDEX_PATH: str = "knowledge_base/faiss_index"
-    SUPPORTED_LANGUAGES: List[str] = ["en", "hi", "mr"]  # English, Hindi, Marathi
-    CONFIDENCE_THRESHOLD: float = 0.6
-    MAX_RESPONSE_TIME: int = 2  # seconds
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///support_agent.db")
+# For vector database and embeddings
+try:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from langchain_community.vectorstores import FAISS
+    from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+    from langchain.chains import RetrievalQA
+    from langchain.docstore.document import Document as LangchainDocument
+    from langchain.prompts import PromptTemplate
+except ImportError:
+    st.warning("Please install: pip install langchain langchain-openai langchain-community faiss-cpu")
+
+# For language detection and translation
+try:
+    from langdetect import detect, LangDetectException
+    from deep_translator import GoogleTranslator
+except ImportError:
+    st.warning("Please install: pip install langdetect deep-translator")
+
+# For web scraping
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except ImportError:
+    st.warning("Please install: pip install requests beautifulsoup4")
+
+# For OCR
+try:
+    import pytesseract
+    from PIL import Image
+except ImportError:
+    st.warning("Please install: pip install pytesseract Pillow")
+
+# For semantic similarity (confidence scoring)
+try:
+    from sklearn.metrics.pairwise import cosine_similarity
+    import numpy as np
+except ImportError:
+    st.warning("Please install: pip install scikit-learn numpy")
+
+# Page configuration
+st.set_page_config(
+    page_title="AI Support Agent",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .chat-message {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin-bottom: 1rem;
+    }
+    .user-message {
+        background-color: #e3f2fd;
+        margin-left: 2rem;
+    }
+    .bot-message {
+        background-color: #f5f5f5;
+        margin-right: 2rem;
+    }
+    .ticket-card {
+        padding: 1rem;
+        border: 1px solid #ddd;
+        border-radius: 0.5rem;
+        margin-bottom: 0.5rem;
+    }
+    .confidence-high {
+        color: #2ecc71;
+        font-weight: bold;
+    }
+    .confidence-medium {
+        color: #f39c12;
+        font-weight: bold;
+    }
+    .confidence-low {
+        color: #e74c3c;
+        font-weight: bold;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Database setup
+def init_database():
+    """Initialize SQLite database for persistence"""
+    conn = sqlite3.connect('support_agent.db', check_same_thread=False)
+    c = conn.cursor()
     
-config = Config()
-
-# ============================================================================
-# DATA MODELS
-# ============================================================================
-
-class QueryCategory(Enum):
-    """Categories for customer queries"""
-    BILLING = "billing"
-    TECHNICAL = "technical"
-    PRODUCT_INFO = "product_info"
-    WARRANTY = "warranty"
-    GENERAL = "general"
-    COMPLAINT = "complaint"
-    SERVICE = "service"
-
-class CommunicationChannel(Enum):
-    """Communication channels"""
-    WEBSITE_CHAT = "website_chat"
-    WHATSAPP = "whatsapp"
-    EMAIL = "email"
-
-class TicketStatus(Enum):
-    """Support ticket status"""
-    OPEN = "open"
-    IN_PROGRESS = "in_progress"
-    RESOLVED = "resolved"
-    CLOSED = "closed"
-
-@dataclass
-class CustomerQuery:
-    """Represents a customer query"""
-    record_id: str
-    business_unit: str
-    customer_query: str
-    query_category: QueryCategory
-    language: str
-    communication_channel: CommunicationChannel
-    timestamp: datetime.datetime
+    # Chat history table
+    c.execute('''CREATE TABLE IF NOT EXISTS chat_history
+                 (id TEXT PRIMARY KEY, role TEXT, message TEXT, timestamp TEXT, 
+                  confidence REAL, response_time REAL, language TEXT, category TEXT)''')
     
-    def to_dict(self) -> Dict:
-        return {
-            "record_id": self.record_id,
-            "business_unit": self.business_unit,
-            "customer_query": self.customer_query,
-            "query_category": self.query_category.value,
-            "language": self.language,
-            "communication_channel": self.communication_channel.value,
-            "timestamp": self.timestamp.isoformat()
+    # Tickets table
+    c.execute('''CREATE TABLE IF NOT EXISTS tickets
+                 (id TEXT PRIMARY KEY, query TEXT, language TEXT, category TEXT, 
+                  status TEXT, priority TEXT, assigned_to TEXT, timestamp TEXT, 
+                  resolved_at TEXT, resolution_time REAL)''')
+    
+    # Feedback table
+    c.execute('''CREATE TABLE IF NOT EXISTS feedback
+                 (chat_id TEXT, feedback TEXT, timestamp TEXT)''')
+    
+    # Analytics table
+    c.execute('''CREATE TABLE IF NOT EXISTS analytics
+                 (date TEXT, total_queries INTEGER, answered INTEGER, escalated INTEGER,
+                  avg_response_time REAL, avg_confidence REAL)''')
+    
+    conn.commit()
+    return conn
+
+# Initialize database
+if 'db_conn' not in st.session_state:
+    st.session_state.db_conn = init_database()
+
+# Initialize session state
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+if 'tickets' not in st.session_state:
+    st.session_state.tickets = []
+if 'analytics' not in st.session_state:
+    st.session_state.analytics = {
+        'total_queries': 0,
+        'answered': 0,
+        'escalated': 0,
+        'languages': {'English': 0, 'Hindi': 0, 'Marathi': 0, 'Other': 0},
+        'categories': {'Billing': 0, 'Technical': 0, 'General': 0}
+    }
+if 'vector_store' not in st.session_state:
+    st.session_state.vector_store = None
+if 'knowledge_base_text' not in st.session_state:
+    st.session_state.knowledge_base_text = ""
+if 'feedback' not in st.session_state:
+    st.session_state.feedback = {}
+if 'embeddings_model' not in st.session_state:
+    st.session_state.embeddings_model = None
+
+# Helper Functions
+def extract_text_from_pdf(file) -> str:
+    """Extract text from PDF file"""
+    try:
+        pdf_reader = PyPDF2.PdfReader(file)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        st.error(f"Error reading PDF: {str(e)}")
+        return ""
+
+def extract_text_from_docx(file) -> str:
+    """Extract text from DOCX file"""
+    try:
+        doc = Document(file)
+        text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+        return text
+    except Exception as e:
+        st.error(f"Error reading DOCX: {str(e)}")
+        return ""
+
+def extract_text_from_image(image_file) -> str:
+    """Extract text from image using OCR"""
+    try:
+        image = Image.open(image_file)
+        text = pytesseract.image_to_string(image)
+        return text
+    except Exception as e:
+        st.error(f"Error performing OCR: {str(e)}")
+        return ""
+
+def scrape_url(url: str) -> str:
+    """Scrape text content from URL"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Remove script and style elements
+        for script in soup(["script", "style"]):
+            script.decompose()
+        
+        # Get text
+        text = soup.get_text()
+        
+        # Clean up text
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        text = '\n'.join(chunk for chunk in chunks if chunk)
+        
+        return text
+    except Exception as e:
+        st.error(f"Error scraping URL {url}: {str(e)}")
+        return ""
 
-@dataclass
-class AIResponse:
-    """AI-generated response"""
-    query: CustomerQuery
-    response_text: str
-    confidence_score: float
-    ticket_created: bool
-    ticket_id: Optional[str] = None
-    
-    def to_dict(self) -> Dict:
-        return {
-            "query": self.query.to_dict(),
-            "response_text": self.response_text,
-            "confidence_score": self.confidence_score,
-            "ticket_created": self.ticket_created,
-            "ticket_id": self.ticket_id
+def detect_language(text: str) -> str:
+    """Detect language of text"""
+    try:
+        lang_code = detect(text)
+        lang_map = {
+            'en': 'English',
+            'hi': 'Hindi',
+            'mr': 'Marathi'
         }
+        return lang_map.get(lang_code, 'Other')
+    except:
+        return 'English'
 
-@dataclass
-class SupportTicket:
-    """Support ticket for escalation"""
-    ticket_id: str
-    query: CustomerQuery
-    ai_response: AIResponse
-    assigned_to: Optional[str] = None
-    status: TicketStatus = TicketStatus.OPEN
-    created_at: datetime.datetime = datetime.datetime.now(pytz.UTC)
-    
-    def to_dict(self) -> Dict:
-        return {
-            "ticket_id": self.ticket_id,
-            "query": self.query.to_dict(),
-            "ai_response": self.ai_response.to_dict(),
-            "assigned_to": self.assigned_to,
-            "status": self.status.value,
-            "created_at": self.created_at.isoformat()
-        }
-
-# ============================================================================
-# KNOWLEDGE BASE INGESTION MODULE
-# ============================================================================
-
-class KnowledgeBaseIngestor:
-    """Handles ingestion of various document types into searchable knowledge base"""
-    
-    def __init__(self):
-        self.vector_db = None
-        self.knowledge_chunks = []
+def translate_text(text: str, target_lang: str) -> str:
+    """Translate text to target language"""
+    try:
+        if target_lang == 'English':
+            return text
         
-    def ingest_pdf(self, pdf_path: str) -> List[str]:
-        """Extract text from PDF files"""
-        try:
-            import PyPDF2
-            text_chunks = []
-            with open(pdf_path, 'rb') as file:
-                reader = PyPDF2.PdfReader(file)
-                for page in reader.pages:
-                    text = page.extract_text()
-                    if text:
-                        chunks = self._chunk_text(text)
-                        text_chunks.extend(chunks)
-            logger.info(f"Ingested PDF: {pdf_path} - {len(text_chunks)} chunks")
-            return text_chunks
-        except Exception as e:
-            logger.error(f"Error ingesting PDF {pdf_path}: {e}")
-            return []
-    
-    def ingest_website(self, url: str) -> List[str]:
-        """Crawl website and extract content"""
-        try:
-            from bs4 import BeautifulSoup
-            import requests
-            
-            response = requests.get(url)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Remove scripts and styles
-            for script in soup(["script", "style"]):
-                script.decompose()
-            
-            text = soup.get_text()
-            chunks = self._chunk_text(text)
-            logger.info(f"Ingested website: {url} - {len(chunks)} chunks")
-            return chunks
-        except Exception as e:
-            logger.error(f"Error ingesting website {url}: {e}")
-            return []
-    
-    def ingest_docx(self, docx_path: str) -> List[str]:
-        """Extract text from DOCX files"""
-        try:
-            from docx import Document
-            doc = Document(docx_path)
-            text = "\n".join([para.text for para in doc.paragraphs])
-            chunks = self._chunk_text(text)
-            logger.info(f"Ingested DOCX: {docx_path} - {len(chunks)} chunks")
-            return chunks
-        except Exception as e:
-            logger.error(f"Error ingesting DOCX {docx_path}: {e}")
-            return []
-    
-    def add_faq(self, faq_list: List[Dict[str, str]]) -> List[str]:
-        """Add FAQ entries to knowledge base"""
-        chunks = []
-        for faq in faq_list:
-            chunk = f"Q: {faq.get('question')}\nA: {faq.get('answer')}"
-            chunks.append(chunk)
-        logger.info(f"Added {len(chunks)} FAQ entries")
-        return chunks
-    
-    def _chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
-        """Split text into manageable chunks"""
-        words = text.split()
-        chunks = []
-        current_chunk = []
-        current_length = 0
-        
-        for word in words:
-            current_chunk.append(word)
-            current_length += len(word) + 1
-            
-            if current_length >= chunk_size:
-                chunks.append(" ".join(current_chunk))
-                current_chunk = []
-                current_length = 0
-        
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
-        
-        return chunks
-    
-    def create_embeddings(self, chunks: List[str]):
-        """Create vector embeddings for knowledge chunks"""
-        try:
-            import faiss
-            import numpy as np
-            from sentence_transformers import SentenceTransformer
-            
-            # Load embedding model
-            model = SentenceTransformer('all-MiniLM-L6-v2')
-            embeddings = model.encode(chunks)
-            
-            # Create FAISS index
-            dimension = embeddings.shape[1]
-            index = faiss.IndexFlatL2(dimension)
-            index.add(np.array(embeddings).astype('float32'))
-            
-            # Save index
-            faiss.write_index(index, config.FAISS_INDEX_PATH)
-            self.knowledge_chunks = chunks
-            logger.info(f"Created embeddings for {len(chunks)} chunks")
-            
-        except Exception as e:
-            logger.error(f"Error creating embeddings: {e}")
-    
-    def search_knowledge(self, query: str, top_k: int = 3) -> List[str]:
-        """Search knowledge base for relevant information"""
-        try:
-            import faiss
-            import numpy as np
-            from sentence_transformers import SentenceTransformer
-            
-            if not os.path.exists(config.FAISS_INDEX_PATH):
-                return []
-            
-            # Load model and index
-            model = SentenceTransformer('all-MiniLM-L6-v2')
-            index = faiss.read_index(config.FAISS_INDEX_PATH)
-            
-            # Encode query
-            query_embedding = model.encode([query])
-            
-            # Search
-            distances, indices = index.search(
-                np.array(query_embedding).astype('float32'), 
-                top_k
-            )
-            
-            results = []
-            for idx in indices[0]:
-                if idx < len(self.knowledge_chunks):
-                    results.append(self.knowledge_chunks[idx])
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Error searching knowledge: {e}")
-            return []
-
-# ============================================================================
-# AI RESPONSE GENERATOR
-# ============================================================================
-
-class AIResponseGenerator:
-    """Generates AI responses using LLM"""
-    
-    def __init__(self, knowledge_base: KnowledgeBaseIngestor):
-        self.knowledge_base = knowledge_base
-        
-    def generate_response(self, query: CustomerQuery) -> AIResponse:
-        """Generate AI response for customer query"""
-        
-        # Search knowledge base
-        context_chunks = self.knowledge_base.search_knowledge(query.customer_query)
-        context = "\n\n".join(context_chunks)
-        
-        # Prepare prompt
-        prompt = self._build_prompt(query, context)
-        
-        try:
-            # Call LLM API (using OpenAI as example)
-            import openai
-            
-            openai.api_key = config.OPENAI_API_KEY
-            
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a helpful customer support agent."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=500
-            )
-            
-            response_text = response.choices[0].message.content
-            
-            # Calculate confidence score (simplified)
-            confidence = self._calculate_confidence(query.customer_query, context_chunks, response_text)
-            
-            # Decide if ticket needs to be created
-            ticket_created = confidence < config.CONFIDENCE_THRESHOLD
-            ticket_id = None
-            
-            if ticket_created:
-                ticket_id = self._generate_ticket_id(query)
-                response_text = f"{response_text}\n\nYour query has been escalated to our support team. Ticket ID: {ticket_id}"
-            
-            return AIResponse(
-                query=query,
-                response_text=response_text,
-                confidence_score=confidence,
-                ticket_created=ticket_created,
-                ticket_id=ticket_id
-            )
-            
-        except Exception as e:
-            logger.error(f"Error generating AI response: {e}")
-            # Fallback response
-            return AIResponse(
-                query=query,
-                response_text="I apologize, but I'm having trouble processing your request. Our support team will contact you shortly.",
-                confidence_score=0.0,
-                ticket_created=True,
-                ticket_id=self._generate_ticket_id(query)
-            )
-    
-    def _build_prompt(self, query: CustomerQuery, context: str) -> str:
-        """Build prompt for LLM"""
-        language_map = {
-            "en": "English",
-            "hi": "Hindi",
-            "mr": "Marathi"
+        lang_code_map = {
+            'Hindi': 'hi',
+            'Marathi': 'mr'
         }
         
-        prompt = f"""
-        Customer Query: {query.customer_query}
-        Query Language: {language_map.get(query.language, 'English')}
-        Business Unit: {query.business_unit}
-        
-        Context from Knowledge Base:
-        {context}
-        
-        Instructions:
-        1. Respond in the same language as the query
-        2. Use the provided context to answer accurately
-        3. If information is not available, admit you don't know
-        4. Be helpful and professional
-        5. Keep response concise but complete
-        
-        Response:
-        """
-        return prompt
-    
-    def _calculate_confidence(self, query: str, context: List[str], response: str) -> float:
-        """Calculate confidence score for AI response"""
-        # Simplified confidence calculation
-        # In production, this would use more sophisticated methods
-        
-        if not context:
-            return 0.0
-        
-        # Check if response contains "I don't know" type phrases
-        low_confidence_phrases = [
-            "I don't know",
-            "I'm not sure",
-            "I cannot answer",
-            "please contact support",
-            "escalated to our team"
-        ]
-        
-        for phrase in low_confidence_phrases:
-            if phrase.lower() in response.lower():
-                return 0.3
-        
-        # Higher confidence if context was found
-        return 0.8 if len(context) > 0 else 0.2
-    
-    def _generate_ticket_id(self, query: CustomerQuery) -> str:
-        """Generate unique ticket ID"""
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        business_prefix = query.business_unit[:3].upper()
-        return f"TICKET-{business_prefix}-{timestamp}"
+        target_code = lang_code_map.get(target_lang, 'en')
+        translator = GoogleTranslator(source='auto', target=target_code)
+        translated = translator.translate(text)
+        return translated
+    except Exception as e:
+        st.warning(f"Translation failed: {str(e)}")
+        return text
 
-# ============================================================================
-# CHAT SUPPORT AGENT (WEBSITE WIDGET)
-# ============================================================================
+def categorize_query(query: str) -> str:
+    """Keyword-based categorization with AI enhancement"""
+    query_lower = query.lower()
+    
+    billing_keywords = ['payment', 'invoice', 'bill', 'charge', 'refund', 'price', 'cost', 
+                       'subscription', 'card', 'billing', 'money', 'paid']
+    technical_keywords = ['error', 'bug', 'issue', 'problem', 'not working', 'broken', 
+                         'crash', 'slow', 'loading', 'login', 'access', 'technical']
+    
+    billing_score = sum(1 for keyword in billing_keywords if keyword in query_lower)
+    technical_score = sum(1 for keyword in technical_keywords if keyword in query_lower)
+    
+    if billing_score > technical_score and billing_score > 0:
+        return 'Billing'
+    elif technical_score > 0:
+        return 'Technical'
+    else:
+        return 'General'
 
-class ChatSupportAgent:
-    """Website chat widget implementation"""
-    
-    def __init__(self, ai_generator: AIResponseGenerator):
-        self.ai_generator = ai_generator
-        self.chat_sessions = {}
-    
-    def process_message(self, session_id: str, message: str, 
-                       business_unit: str = "default") -> Dict:
-        """Process incoming chat message"""
+def assign_priority(confidence: float, category: str) -> str:
+    """Assign priority based on confidence and category"""
+    if confidence < 0.4 or category == 'Billing':
+        return 'High'
+    elif confidence < 0.6 or category == 'Technical':
+        return 'Medium'
+    else:
+        return 'Low'
+
+def create_vector_store(text: str, openai_api_key: str):
+    """Create FAISS vector store from text with caching"""
+    try:
+        # Split text into chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len
+        )
+        chunks = text_splitter.split_text(text)
         
-        # Detect language
-        language = self._detect_language(message)
+        # Create documents
+        documents = [LangchainDocument(page_content=chunk) for chunk in chunks]
         
-        # Create query object
-        query = CustomerQuery(
-            record_id=self._generate_record_id(),
-            business_unit=business_unit,
-            customer_query=message,
-            query_category=self._categorize_query(message),
-            language=language,
-            communication_channel=CommunicationChannel.WEBSITE_CHAT,
-            timestamp=datetime.datetime.now(pytz.UTC)
+        # Create embeddings and vector store
+        embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+        st.session_state.embeddings_model = embeddings
+        vector_store = FAISS.from_documents(documents, embeddings)
+        
+        return vector_store
+    except Exception as e:
+        st.error(f"Error creating vector store: {str(e)}")
+        return None
+
+def calculate_semantic_confidence(query: str, retrieved_docs: List, answer: str, embeddings) -> float:
+    """Calculate confidence score using semantic similarity"""
+    try:
+        # Get embeddings
+        query_embedding = embeddings.embed_query(query)
+        answer_embedding = embeddings.embed_query(answer)
+        
+        # Calculate similarity between query and answer
+        query_answer_sim = cosine_similarity(
+            [query_embedding], 
+            [answer_embedding]
+        )[0][0]
+        
+        # Calculate average similarity with retrieved documents
+        if retrieved_docs:
+            doc_embeddings = [embeddings.embed_query(doc.page_content) for doc in retrieved_docs]
+            doc_similarities = cosine_similarity([query_embedding], doc_embeddings)[0]
+            avg_doc_sim = np.mean(doc_similarities)
+        else:
+            avg_doc_sim = 0.0
+        
+        # Combine scores (weighted average)
+        confidence = (0.4 * query_answer_sim + 0.6 * avg_doc_sim)
+        
+        # Adjust based on answer length (penalize very short answers)
+        if len(answer.split()) < 10:
+            confidence *= 0.7
+        
+        return float(min(max(confidence, 0.0), 1.0))
+    except Exception as e:
+        st.warning(f"Confidence calculation error: {str(e)}")
+        # Fallback to simple heuristic
+        return 0.7 if len(retrieved_docs) > 0 and len(answer) > 50 else 0.4
+
+def get_ai_response(query: str, vector_store, openai_api_key: str, target_language: str = 'English') -> Tuple[str, float, List]:
+    """Get AI response using RAG with multilingual support"""
+    try:
+        # Translate query to English if needed
+        english_query = query
+        if target_language != 'English':
+            try:
+                translator = GoogleTranslator(source='auto', target='en')
+                english_query = translator.translate(query)
+            except:
+                pass
+        
+        llm = ChatOpenAI(
+            model_name="gpt-3.5-turbo",
+            temperature=0.3,
+            openai_api_key=openai_api_key
         )
         
-        # Generate AI response
-        response = self.ai_generator.generate_response(query)
+        # Custom prompt for multilingual support
+        prompt_template = """You are a helpful customer support assistant. 
+        Use the following context to answer the question. If you cannot find the answer in the context, 
+        say so politely and suggest contacting support.
         
-        # Store in session
-        if session_id not in self.chat_sessions:
-            self.chat_sessions[session_id] = []
+        Context: {context}
         
-        self.chat_sessions[session_id].append({
-            "query": query.to_dict(),
-            "response": response.to_dict()
+        Question: {question}
+        
+        Provide a helpful, accurate answer:"""
+        
+        PROMPT = PromptTemplate(
+            template=prompt_template,
+            input_variables=["context", "question"]
+        )
+        
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",
+            retriever=vector_store.as_retriever(search_kwargs={"k": 4}),
+            return_source_documents=True,
+            chain_type_kwargs={"prompt": PROMPT}
+        )
+        
+        result = qa_chain({"query": english_query})
+        
+        answer = result['result']
+        source_docs = result['source_documents']
+        
+        # Calculate confidence score
+        confidence = calculate_semantic_confidence(
+            english_query, 
+            source_docs, 
+            answer, 
+            st.session_state.embeddings_model
+        )
+        
+        # Translate answer back to target language if needed
+        if target_language != 'English':
+            answer = translate_text(answer, target_language)
+        
+        return answer, confidence, source_docs
+    except Exception as e:
+        st.error(f"Error getting AI response: {str(e)}")
+        error_msg = "I apologize, but I encountered an error processing your query."
+        if target_language != 'English':
+            error_msg = translate_text(error_msg, target_language)
+        return error_msg, 0.3, []
+
+def create_ticket(query: str, language: str, category: str, confidence: float):
+    """Create escalation ticket with priority and assignment"""
+    priority = assign_priority(confidence, category)
+    
+    # Simple round-robin assignment (in production, use proper assignment logic)
+    agents = ['Agent A', 'Agent B', 'Agent C']
+    assigned_to = agents[len(st.session_state.tickets) % len(agents)]
+    
+    ticket = {
+        'id': str(uuid.uuid4())[:8],
+        'query': query,
+        'language': language,
+        'category': category,
+        'status': 'Open',
+        'priority': priority,
+        'assigned_to': assigned_to,
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'resolved_at': None,
+        'resolution_time': None
+    }
+    
+    st.session_state.tickets.append(ticket)
+    st.session_state.analytics['escalated'] += 1
+    
+    # Save to database
+    conn = st.session_state.db_conn
+    c = conn.cursor()
+    c.execute('''INSERT INTO tickets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              (ticket['id'], ticket['query'], ticket['language'], ticket['category'],
+               ticket['status'], ticket['priority'], ticket['assigned_to'], 
+               ticket['timestamp'], ticket['resolved_at'], ticket['resolution_time']))
+    conn.commit()
+    
+    return ticket['id']
+
+def save_chat_to_db(chat_entry: Dict):
+    """Save chat entry to database"""
+    conn = st.session_state.db_conn
+    c = conn.cursor()
+    
+    chat_id = str(uuid.uuid4())
+    c.execute('''INSERT INTO chat_history VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+              (chat_id, chat_entry['role'], chat_entry['message'], 
+               chat_entry['timestamp'].strftime("%Y-%m-%d %H:%M:%S"),
+               chat_entry.get('confidence', None),
+               chat_entry.get('response_time', None),
+               chat_entry.get('language', None),
+               chat_entry.get('category', None)))
+    conn.commit()
+    return chat_id
+
+def update_daily_analytics():
+    """Update daily analytics in database"""
+    conn = st.session_state.db_conn
+    c = conn.cursor()
+    
+    today = datetime.now().strftime("%Y-%m-%d")
+    analytics = st.session_state.analytics
+    
+    # Calculate averages
+    bot_messages = [msg for msg in st.session_state.chat_history if msg['role'] == 'bot']
+    avg_response_time = sum(msg.get('response_time', 0) for msg in bot_messages) / len(bot_messages) if bot_messages else 0
+    avg_confidence = sum(msg.get('confidence', 0) for msg in bot_messages) / len(bot_messages) if bot_messages else 0
+    
+    c.execute('''INSERT OR REPLACE INTO analytics VALUES (?, ?, ?, ?, ?, ?)''',
+              (today, analytics['total_queries'], analytics['answered'], 
+               analytics['escalated'], avg_response_time, avg_confidence))
+    conn.commit()
+
+# Sidebar - Knowledge Management
+st.sidebar.title("📚 Knowledge Base Management")
+
+# API Key input
+openai_api_key = st.sidebar.text_input("OpenAI API Key", type="password", help="Enter your OpenAI API key")
+
+st.sidebar.markdown("---")
+
+# File uploader (including images for OCR)
+uploaded_files = st.sidebar.file_uploader(
+    "Upload PDF/DOCX/Image files",
+    type=['pdf', 'docx', 'png', 'jpg', 'jpeg'],
+    accept_multiple_files=True
+)
+
+# URL input
+url_input = st.sidebar.text_area("Enter URLs (one per line)", height=100)
+
+# Process button
+if st.sidebar.button("🔄 Process Knowledge Base", type="primary"):
+    if not openai_api_key:
+        st.sidebar.error("Please enter your OpenAI API key first!")
+    else:
+        with st.spinner("Processing knowledge base..."):
+            all_text = ""
+            
+            # Process uploaded files
+            if uploaded_files:
+                progress_bar = st.sidebar.progress(0)
+                for idx, file in enumerate(uploaded_files):
+                    if file.name.endswith('.pdf'):
+                        all_text += extract_text_from_pdf(file) + "\n\n"
+                    elif file.name.endswith('.docx'):
+                        all_text += extract_text_from_docx(file) + "\n\n"
+                    elif file.name.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        ocr_text = extract_text_from_image(file)
+                        if ocr_text:
+                            all_text += f"[OCR from {file.name}]\n{ocr_text}\n\n"
+                    
+                    progress_bar.progress((idx + 1) / len(uploaded_files))
+                progress_bar.empty()
+            
+            # Process URLs
+            if url_input.strip():
+                urls = [url.strip() for url in url_input.split('\n') if url.strip()]
+                progress_bar = st.sidebar.progress(0)
+                for idx, url in enumerate(urls):
+                    st.sidebar.info(f"Scraping: {url[:50]}...")
+                    scraped_text = scrape_url(url)
+                    if scraped_text:
+                        all_text += f"[Content from {url}]\n{scraped_text}\n\n"
+                    progress_bar.progress((idx + 1) / len(urls))
+                progress_bar.empty()
+            
+            if all_text.strip():
+                st.session_state.knowledge_base_text = all_text
+                st.session_state.vector_store = create_vector_store(all_text, openai_api_key)
+                
+                if st.session_state.vector_store:
+                    st.sidebar.success(f"✅ Processed {len(all_text)} characters successfully!")
+                else:
+                    st.sidebar.error("Failed to create vector store")
+            else:
+                st.sidebar.warning("No content to process. Please upload files or enter URLs.")
+
+# Display knowledge base status
+if st.session_state.vector_store:
+    st.sidebar.success("✅ Knowledge Base Active")
+    st.sidebar.metric("KB Size", f"{len(st.session_state.knowledge_base_text):,} chars")
+    
+    # Cache statistics
+    num_docs = st.session_state.vector_store.index.ntotal if st.session_state.vector_store else 0
+    st.sidebar.metric("Indexed Documents", num_docs)
+else:
+    st.sidebar.info("ℹ️ No knowledge base loaded")
+
+st.sidebar.markdown("---")
+st.sidebar.caption("💡 Supports: PDF, DOCX, Images (OCR), Web URLs")
+
+# Main page
+st.markdown('<div class="main-header">🤖 Customer Support & FAQ AI Agent</div>', unsafe_allow_html=True)
+
+# Tabs
+tab1, tab2, tab3 = st.tabs(["💬 Chat Agent", "🎫 Ticket Management", "📊 Analytics Dashboard"])
+
+# Tab 1: Chat Agent
+with tab1:
+    st.header("Chat with AI Support Agent")
+    
+    if not openai_api_key:
+        st.warning("⚠️ Please enter your OpenAI API key in the sidebar to start chatting.")
+    elif not st.session_state.vector_store:
+        st.info("ℹ️ Please upload and process knowledge base files in the sidebar first.")
+    else:
+        # Chat interface
+        chat_container = st.container()
+        
+        # Display chat history
+        with chat_container:
+            for i, chat in enumerate(st.session_state.chat_history):
+                if chat['role'] == 'user':
+                    st.markdown(f'<div class="chat-message user-message">👤 **You:** {chat["message"]}</div>', unsafe_allow_html=True)
+                else:
+                    # Display confidence indicator
+                    confidence = chat.get('confidence', 0)
+                    if confidence >= 0.7:
+                        conf_class = "confidence-high"
+                        conf_emoji = "🟢"
+                    elif confidence >= 0.5:
+                        conf_class = "confidence-medium"
+                        conf_emoji = "🟡"
+                    else:
+                        conf_class = "confidence-low"
+                        conf_emoji = "🔴"
+                    
+                    response_time = chat.get('response_time', 0)
+                    
+                    st.markdown(
+                        f'<div class="chat-message bot-message">'
+                        f'🤖 **AI:** {chat["message"]}<br>'
+                        f'<small>{conf_emoji} Confidence: <span class="{conf_class}">{confidence:.1%}</span> | '
+                        f'⏱️ {response_time:.2f}s</small>'
+                        f'</div>', 
+                        unsafe_allow_html=True
+                    )
+                    
+                    # Feedback buttons
+                    if i not in st.session_state.feedback:
+                        col1, col2, col3 = st.columns([1, 1, 10])
+                        with col1:
+                            if st.button("👍", key=f"up_{i}"):
+                                st.session_state.feedback[i] = 'positive'
+                                st.rerun()
+                        with col2:
+                            if st.button("👎", key=f"down_{i}"):
+                                st.session_state.feedback[i] = 'negative'
+                                st.rerun()
+                    else:
+                        if st.session_state.feedback[i] == 'positive':
+                            st.success("✓ Marked as helpful")
+                        else:
+                            st.error("✗ Marked as not helpful")
+        
+        # Input area
+        with st.form(key="chat_form", clear_on_submit=True):
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                user_input = st.text_input("Ask your question:", placeholder="Type your question here...")
+            with col2:
+                submit_button = st.form_submit_button("Send 🚀", use_container_width=True)
+        
+        if submit_button and user_input:
+            start_time = time.time()
+            
+            # Detect language and category
+            language = detect_language(user_input)
+            category = categorize_query(user_input)
+            
+            # Update analytics
+            st.session_state.analytics['total_queries'] += 1
+            st.session_state.analytics['languages'][language] = st.session_state.analytics['languages'].get(language, 0) + 1
+            st.session_state.analytics['categories'][category] += 1
+            
+            # Add user message to history
+            user_chat = {
+                'role': 'user',
+                'message': user_input,
+                'timestamp': datetime.now(),
+                'language': language,
+                'category': category
+            }
+            st.session_state.chat_history.append(user_chat)
+            save_chat_to_db(user_chat)
+            
+            # Get AI response (with language support)
+            with st.spinner(f"Thinking... ({language} detected)"):
+                answer, confidence, source_docs = get_ai_response(
+                    user_input, 
+                    st.session_state.vector_store, 
+                    openai_api_key,
+                    language
+                )
+            
+            response_time = time.time() - start_time
+            
+            # Check if escalation is needed
+            if confidence < 0.6:
+                ticket_id = create_ticket(user_input, language, category, confidence)
+                escalation_msg = f"\n\n⚠️ **Note:** Your query has been escalated to our support team. Ticket ID: `{ticket_id}` | Priority: {assign_priority(confidence, category)}"
+                if language != 'English':
+                    escalation_msg = translate_text(escalation_msg, language)
+                answer += escalation_msg
+            else:
+                st.session_state.analytics['answered'] += 1
+            
+            # Add bot response to history
+            bot_chat = {
+                'role': 'bot',
+                'message': answer,
+                'timestamp': datetime.now(),
+                'confidence': confidence,
+                'response_time': response_time,
+                'language': language,
+                'category': category
+            }
+            st.session_state.chat_history.append(bot_chat)
+            save_chat_to_db(bot_chat)
+            
+            # Update daily analytics
+            update_daily_analytics()
+            
+            st.rerun()
+
+# Tab 2: Ticket Management
+with tab2:
+    st.header("Escalated Tickets")
+    
+    if st.session_state.tickets:
+        # Filters
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            status_filter = st.multiselect(
+                "Filter by Status",
+                options=['Open', 'In Progress', 'Closed'],
+                default=['Open', 'In Progress']
+            )
+        with col2:
+            priority_filter = st.multiselect(
+                "Filter by Priority",
+                options=['High', 'Medium', 'Low'],
+                default=['High', 'Medium', 'Low']
+            )
+        with col3:
+            category_filter = st.multiselect(
+                "Filter by Category",
+                options=['Billing', 'Technical', 'General'],
+                default=['Billing', 'Technical', 'General']
+            )
+        
+        # Create DataFrame
+        df_tickets = pd.DataFrame(st.session_state.tickets)
+        
+        # Apply filters
+        filtered_df = df_tickets[
+            (df_tickets['status'].isin(status_filter)) &
+            (df_tickets['priority'].isin(priority_filter)) &
+            (df_tickets['category'].isin(category_filter))
+        ]
+        
+        # Summary metrics
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Tickets", len(df_tickets))
+        with col2:
+            st.metric("Open", len(df_tickets[df_tickets['status'] == 'Open']))
+        with col3:
+            st.metric("High Priority", len(df_tickets[df_tickets['priority'] == 'High']))
+        with col4:
+            avg_resolution = df_tickets[df_tickets['resolution_time'].notna()]['resolution_time'].mean()
+            st.metric("Avg Resolution Time", f"{avg_resolution:.1f}h" if not pd.isna(avg_resolution) else "N/A")
+        
+        st.markdown("---")
+        
+        # Display tickets
+        for idx, ticket in filtered_df.iterrows():
+            priority_color = {'High': '🔴', 'Medium': '🟡', 'Low': '🟢'}
+            
+            with st.expander(f"{priority_color[ticket['priority']]} Ticket #{ticket['id']} - {ticket['status']} ({ticket['priority']} Priority)"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write(f"**Query:** {ticket['query']}")
+                    st.write(f"**Category:** {ticket['category']}")
+                    st.write(f"**Language:** {ticket['language']}")
+                with col2:
+                    st.write(f"**Assigned To:** {ticket['assigned_to']}")
+                    st.write(f"**Created:** {ticket['timestamp']}")
+                    if ticket['resolved_at']:
+                        st.write(f"**Resolved:** {ticket['resolved_at']}")
+                        st.write(f"**Resolution Time:** {ticket['resolution_time']:.1f}h")
+                
+                # Status update
+                col1, col2, col3 = st.columns([2, 2, 1])
+                with col1:
+                    new_status = st.selectbox(
+                        "Update Status",
+                        options=['Open', 'In Progress', 'Closed'],
+                        index=['Open', 'In Progress', 'Closed'].index(ticket['status']),
+                        key=f"status_{ticket['id']}"
+                    )
+                with col2:
+                    new_assignee = st.selectbox(
+                        "Reassign To",
+                        options=['Agent A', 'Agent B', 'Agent C'],
+                        index=['Agent A', 'Agent B', 'Agent C'].index(ticket['assigned_to']),
+                        key=f"assign_{ticket['id']}"
+                    )
+                with col3:
+                    st.write("")
+                    st.write("")
+                    if st.button("Update", key=f"update_{ticket['id']}", type="primary"):
+                        # Calculate resolution time if closing
+                        if new_status == 'Closed' and ticket['status'] != 'Closed':
+                            created = datetime.strptime(ticket['timestamp'], "%Y-%m-%d %H:%M:%S")
+                            resolution_time = (datetime.now() - created).total_seconds() / 3600
+                            st.session_state.tickets[idx]['resolved_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            st.session_state.tickets[idx]['resolution_time'] = resolution_time
+                        
+                        st.session_state.tickets[idx]['status'] = new_status
+                        st.session_state.tickets[idx]['assigned_to'] = new_assignee
+                        st.success(f"Ticket #{ticket['id']} updated!")
+                        st.rerun()
+    else:
+        st.info("No escalated tickets yet.")
+
+# Tab 3: Analytics Dashboard
+with tab3:
+    st.header("Analytics Dashboard")
+    
+    analytics = st.session_state.analytics
+    
+    # Metrics row
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Queries", analytics['total_queries'])
+    with col2:
+        st.metric("Answered", analytics['answered'])
+    with col3:
+        st.metric("Escalated", analytics['escalated'])
+    with col4:
+        resolution_rate = (analytics['answered'] / analytics['total_queries'] * 100) if analytics['total_queries'] > 0 else 0
+        st.metric("Resolution Rate", f"{resolution_rate:.1f}%")
+    
+    st.markdown("---")
+    
+    # Time-based analytics
+    if st.session_state.chat_history:
+        st.subheader("📈 Query Trends")
+        
+        # Create time series data
+        chat_df = pd.DataFrame([
+            {
+                'timestamp': chat['timestamp'],
+                'role': chat['role'],
+                'confidence': chat.get('confidence', None),
+                'response_time': chat.get('response_time', None)
+            }
+            for chat in st.session_state.chat_history
+        ])
+        
+        # Queries over time
+        chat_df['hour'] = pd.to_datetime(chat_df['timestamp']).dt.floor('H')
+        hourly_queries = chat_df[chat_df['role'] == 'user'].groupby('hour').size().reset_index(name='queries')
+        
+        if len(hourly_queries) > 0:
+            fig_timeline = px.line(
+                hourly_queries,
+                x='hour',
+                y='queries',
+                title="Queries Over Time",
+                labels={'hour': 'Time', 'queries': 'Number of Queries'}
+            )
+            st.plotly_chart(fig_timeline, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # Charts row 1
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Query Distribution
+        fig_queries = go.Figure(data=[
+            go.Bar(
+                x=['Answered', 'Escalated'],
+                y=[analytics['answered'], analytics['escalated']],
+                marker_color=['#2ecc71', '#e74c3c'],
+                text=[analytics['answered'], analytics['escalated']],
+                textposition='auto'
+            )
+        ])
+        fig_queries.update_layout(
+            title="Query Distribution",
+            xaxis_title="Status",
+            yaxis_title="Count",
+            height=300
+        )
+        st.plotly_chart(fig_queries, use_container_width=True)
+    
+    with col2:
+        # Language Distribution
+        lang_data = {k: v for k, v in analytics['languages'].items() if v > 0}
+        if lang_data:
+            fig_lang = px.pie(
+                values=list(lang_data.values()),
+                names=list(lang_data.keys()),
+                title="Language Distribution"
+            )
+            fig_lang.update_layout(height=300)
+            st.plotly_chart(fig_lang, use_container_width=True)
+        else:
+            st.info("No language data available yet")
+    
+    # Charts row 2
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Category Breakdown
+        st.subheader("Category Breakdown")
+        category_df = pd.DataFrame({
+            'Category': list(analytics['categories'].keys()),
+            'Count': list(analytics['categories'].values())
         })
         
-        # Format response for chat
-        chat_response = {
-            "session_id": session_id,
-            "message": response.response_text,
-            "ticket_created": response.ticket_created,
-            "ticket_id": response.ticket_id,
-            "confidence": response.confidence_score,
-            "timestamp": datetime.datetime.now(pytz.UTC).isoformat()
-        }
-        
-        return chat_response
+        fig_category = px.bar(
+            category_df,
+            x='Category',
+            y='Count',
+            color='Category',
+            title="Queries by Category"
+        )
+        st.plotly_chart(fig_category, use_container_width=True)
     
-    def _detect_language(self, text: str) -> str:
-        """Detect language of text"""
-        # Simplified language detection
-        # In production, use libraries like langdetect or fasttext
+    with col2:
+        # Performance Metrics
+        st.subheader("Performance Metrics")
+        bot_messages = [msg for msg in st.session_state.chat_history if msg['role'] == 'bot']
         
-        hindi_chars = set("अआइईउऊऋएऐओऔकखगघचछजझटठडढणतथधनपफबभमयरलवशषसह")
-        marathi_chars = set("अआइईउऊऋएऐओऔकखगघचछजझटठडढणतथधनपफबभमयरलवशषसह")
-        
-        text_chars = set(text)
-        
-        if text_chars.intersection(hindi_chars):
-            return "hi"
-        elif text_chars.intersection(marathi_chars):
-            return "mr"
+        if bot_messages:
+            avg_response_time = sum(msg.get('response_time', 0) for msg in bot_messages) / len(bot_messages)
+            avg_confidence = sum(msg.get('confidence', 0) for msg in bot_messages) / len(bot_messages)
+            
+            perf_metrics = pd.DataFrame({
+                'Metric': ['Avg Response Time (s)', 'Avg Confidence Score'],
+                'Value': [avg_response_time, avg_confidence]
+            })
+            
+            fig_perf = go.Figure(data=[
+                go.Bar(
+                    x=perf_metrics['Metric'],
+                    y=perf_metrics['Value'],
+                    marker_color=['#3498db', '#9b59b6'],
+                    text=[f"{avg_response_time:.2f}s", f"{avg_confidence:.1%}"],
+                    textposition='auto'
+                )
+            ])
+            fig_perf.update_layout(
+                title="Average Performance",
+                height=300,
+                yaxis_title="Value"
+            )
+            st.plotly_chart(fig_perf, use_container_width=True)
         else:
-            return "en"
+            st.info("No performance data available yet")
     
-    def _categorize_query(self, text: str) -> QueryCategory:
-        """Categorize the query"""
-        text_lower = text.lower()
-        
-        category_keywords = {
-            QueryCategory.BILLING: ["payment", "bill", "invoice", "refund", "price", "cost"],
-            QueryCategory.TECHNICAL: ["error", "bug", "technical", "issue", "problem", "not working"],
-            QueryCategory.PRODUCT_INFO: ["what is", "how to", "feature", "specification", "details"],
-            QueryCategory.WARRANTY: ["warranty", "guarantee", "repair", "replace"],
-            QueryCategory.SERVICE: ["service", "install", "setup", "configure", "maintenance"],
-            QueryCategory.COMPLAINT: ["complaint", "bad", "poor", "terrible", "angry", "frustrated"]
-        }
-        
-        for category, keywords in category_keywords.items():
-            if any(keyword in text_lower for keyword in keywords):
-                return category
-        
-        return QueryCategory.GENERAL
+    # Confidence distribution
+    st.markdown("---")
+    st.subheader("Confidence Score Distribution")
     
-    def _generate_record_id(self) -> str:
-        """Generate unique record ID"""
-        return f"CHAT-{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-
-# ============================================================================
-# WHATSAPP SUPPORT AGENT
-# ============================================================================
-
-class WhatsAppSupportAgent:
-    """WhatsApp Business API integration"""
-    
-    def __init__(self, ai_generator: AIResponseGenerator):
-        self.ai_generator = ai_generator
-    
-    def process_whatsapp_message(self, from_number: str, message: str,
-                                business_unit: str = "default") -> Dict:
-        """Process incoming WhatsApp message"""
+    if bot_messages:
+        confidences = [msg.get('confidence', 0) for msg in bot_messages]
         
-        language = self._detect_language(message)
-        
-        query = CustomerQuery(
-            record_id=self._generate_record_id(),
-            business_unit=business_unit,
-            customer_query=message,
-            query_category=self._categorize_query(message),
-            language=language,
-            communication_channel=CommunicationChannel.WHATSAPP,
-            timestamp=datetime.datetime.now(pytz.UTC)
+        fig_conf = px.histogram(
+            x=confidences,
+            nbins=20,
+            title="Distribution of AI Confidence Scores",
+            labels={'x': 'Confidence Score', 'y': 'Frequency'},
+            color_discrete_sequence=['#1f77b4']
         )
-        
-        response = self.ai_generator.generate_response(query)
-        
-        # Format for WhatsApp API
-        whatsapp_response = {
-            "to": from_number,
-            "message": response.response_text,
-            "ticket_created": response.ticket_created,
-            "ticket_id": response.ticket_id,
-            "timestamp": datetime.datetime.now(pytz.UTC).isoformat()
-        }
-        
-        return whatsapp_response
+        fig_conf.add_vline(x=0.6, line_dash="dash", line_color="red", 
+                          annotation_text="Escalation Threshold (0.6)")
+        st.plotly_chart(fig_conf, use_container_width=True)
     
-    def _detect_language(self, text: str) -> str:
-        """Detect language for WhatsApp messages"""
-        return ChatSupportAgent._detect_language(self, text)
+    # Customer Satisfaction
+    st.markdown("---")
+    st.subheader("Customer Satisfaction")
     
-    def _categorize_query(self, text: str) -> QueryCategory:
-        """Categorize WhatsApp queries"""
-        return ChatSupportAgent._categorize_query(self, text)
-    
-    def _generate_record_id(self) -> str:
-        """Generate unique record ID for WhatsApp"""
-        return f"WA-{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-
-# ============================================================================
-# EMAIL AUTO-RESPONDER
-# ============================================================================
-
-class EmailAutoResponder:
-    """Email auto-responder system"""
-    
-    def __init__(self, ai_generator: AIResponseGenerator):
-        self.ai_generator = ai_generator
-    
-    def process_email(self, from_email: str, subject: str, body: str,
-                     business_unit: str = "default") -> Dict:
-        """Process incoming support email"""
+    if st.session_state.feedback:
+        positive = sum(1 for f in st.session_state.feedback.values() if f == 'positive')
+        negative = sum(1 for f in st.session_state.feedback.values() if f == 'negative')
+        total_feedback = positive + negative
         
-        # Combine subject and body for processing
-        full_text = f"{subject}\n\n{body}"
-        language = self._detect_language(full_text)
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Feedback", total_feedback)
+        with col2:
+            st.metric("Positive", positive, f"{positive/total_feedback*100:.1f}%")
+        with col3:
+            st.metric("Negative", negative, f"{negative/total_feedback*100:.1f}%")
         
-        query = CustomerQuery(
-            record_id=self._generate_record_id(),
-            business_unit=business_unit,
-            customer_query=full_text,
-            query_category=self._categorize_email(subject, body),
-            language=language,
-            communication_channel=CommunicationChannel.EMAIL,
-            timestamp=datetime.datetime.now(pytz.UTC)
+        # Satisfaction pie chart
+        fig_satisfaction = px.pie(
+            values=[positive, negative],
+            names=['Positive 👍', 'Negative 👎'],
+            title="User Satisfaction",
+            color_discrete_sequence=['#2ecc71', '#e74c3c']
         )
-        
-        response = self.ai_generator.generate_response(query)
-        
-        # Format email response
-        email_response = {
-            "to": from_email,
-            "subject": f"Re: {subject}",
-            "body": response.response_text,
-            "ticket_created": response.ticket_created,
-            "ticket_id": response.ticket_id,
-            "timestamp": datetime.datetime.now(pytz.UTC).isoformat()
-        }
-        
-        return email_response
+        st.plotly_chart(fig_satisfaction, use_container_width=True)
+    else:
+        st.info("No customer feedback received yet")
     
-    def _categorize_email(self, subject: str, body: str) -> QueryCategory:
-        """Categorize email content"""
-        full_text = f"{subject} {body}".lower()
+    # Peak Hours Analysis
+    if st.session_state.chat_history:
+        st.markdown("---")
+        st.subheader("📊 Peak Hours Analysis")
         
-        if any(word in full_text for word in ["invoice", "payment", "bill", "refund"]):
-            return QueryCategory.BILLING
-        elif any(word in full_text for word in ["error", "bug", "technical", "issue"]):
-            return QueryCategory.TECHNICAL
-        elif any(word in full_text for word in ["warranty", "guarantee"]):
-            return QueryCategory.WARRANTY
-        elif any(word in full_text for word in ["service", "install", "maintenance"]):
-            return QueryCategory.SERVICE
-        
-        return QueryCategory.GENERAL
-    
-    def _detect_language(self, text: str) -> str:
-        """Detect language for emails"""
-        return ChatSupportAgent._detect_language(self, text)
-    
-    def _generate_record_id(self) -> str:
-        """Generate unique record ID for emails"""
-        return f"EMAIL-{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+        user_chats = [chat for chat in st.session_state.chat_history if chat['role'] == 'user']
+        if user_chats:
+            hours = [chat['timestamp'].hour for chat in user_chats]
+            hour_counts = pd.Series(hours).value_counts().sort_index()
+            
+            fig_peak = px.bar(
+                x=hour_counts.index,
+                y=hour_counts.values,
+                title="Query Volume by Hour of Day",
+                labels={'x': 'Hour of Day', 'y': 'Number of Queries'},
+                color=hour_counts.values,
+                color_continuous_scale='Blues'
+            )
+            fig_peak.update_layout(showlegend=False)
+            st.plotly_chart(fig_peak, use_container_width=True)
 
-# ============================================================================
-# TICKET MANAGEMENT SYSTEM
-# ============================================================================
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: #666;'>
+    <p><strong>AI Customer Support Agent v2.0 (Complete Edition)</strong></p>
+    <p>Powered by OpenAI GPT-3.5, LangChain & FAISS</p>
+    <p><small>✅ Features: PDF/DOCX/Image Processing | Web Scraping | OCR | Multilingual (EN/HI/MR) | 
+    Semantic Confidence Scoring | Ticket Management | Real-time Analytics | Persistent Database</small></p>
+</div>
+""", unsafe_allow_html=True)
 
-class TicketManagementSystem:
-    """Manages support ticket creation and tracking"""
+# Export data functionality
+with st.sidebar:
+    st.markdown("---")
+    st.subheader("📥 Export Data")
     
-    def __init__(self):
-        self.tickets = {}
-        self.support_staff = ["support1@company.com", "support2@company.com"]
+    if st.button("Export Chat History (CSV)"):
+        if st.session_state.chat_history:
+            df = pd.DataFrame(st.session_state.chat_history)
+            csv = df.to_csv(index=False)
+            st.download_button(
+                "Download CSV",
+                csv,
+                "chat_history.csv",
+                "text/csv"
+            )
     
-    def create_ticket(self, query: CustomerQuery, 
-                     ai_response: AIResponse) -> SupportTicket:
-        """Create a new support ticket"""
-        
-        ticket_id = ai_response.ticket_id or self._generate_ticket_id()
-        
-        ticket = SupportTicket(
-            ticket_id=ticket_id,
-            query=query,
-            ai_response=ai_response,
-            assigned_to=self._assign_to_staff(),
-            status=TicketStatus.OPEN
-        )
-        
-        self.tickets[ticket_id] = ticket
-        
-        # Notify support staff
-        self._notify_staff(ticket)
-        
-        logger.info(f"Created ticket: {ticket_id}")
-        return ticket
+    if st.button("Export Tickets (CSV)"):
+        if st.session_state.tickets:
+            df = pd.DataFrame(st.session_state.tickets)
+            csv = df.to_csv(index=False)
+            st.download_button(
+                "Download CSV",
+                csv,
+                "tickets.csv",
+                "text/csv"
+            )
     
-    def update_ticket_status(self, ticket_id: str, status: TicketStatus,
-                            assigned_to: Optional[str] = None) -> bool:
-        """Update ticket status"""
-        if ticket_id in self.tickets:
-            self.tickets[ticket_id].status = status
-            if assigned_to:
-                self.tickets[ticket_id].assigned_to = assigned_to
-            return True
-        return False
-    
-    def get_ticket(self, ticket_id: str) -> Optional[SupportTicket]:
-        """Get ticket by ID"""
-        return self.tickets.get(ticket_id)
-    
-    def get_all_tickets(self, status: Optional[TicketStatus] = None) -> List[SupportTicket]:
-        """Get all tickets, optionally filtered by status"""
-        if status:
-            return [ticket for ticket in self.tickets.values() 
-                   if ticket.status == status]
-        return list(self.tickets.values())
-    
-    def _generate_ticket_id(self) -> str:
-        """Generate unique ticket ID"""
-        return f"TICKET-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
-    
-    def _assign_to_staff(self) -> str:
-        """Assign ticket to support staff (round-robin)"""
-        if not hasattr(self, '_staff_index'):
-            self._staff_index = 0
-        
-        staff = self.support_staff[self._staff_index]
-        self._staff_index = (self._staff_index + 1) % len(self.support_staff)
-        return staff
-    
-    def _notify_staff(self, ticket: SupportTicket):
-        """Notify support staff about new ticket"""
-        # In production, this would send email/WhatsApp notification
-        logger.info(f"Notified {ticket.assigned_to} about ticket {ticket.ticket_id}")
-
-# ============================================================================
-# ANALYTICS DASHBOARD
-# ============================================================================
-
-class AnalyticsDashboard:
-    """Analytics and reporting dashboard"""
-    
-    def __init__(self, chat_agent: ChatSupportAgent, 
-                 whatsapp_agent: WhatsAppSupportAgent,
-                 email_agent: EmailAutoResponder,
-                 ticket_system: TicketManagementSystem):
-        
-        self.chat_agent = chat_agent
-        self.whatsapp_agent = whatsapp_agent
-        self.email_agent = email_agent
-        self.ticket_system = ticket_system
-        self.analytics_data = {
-            "daily_queries": [],
-            "resolved_vs_escalated": {"resolved": 0, "escalated": 0},
-            "category_distribution": {},
-            "language_distribution": {},
-            "channel_distribution": {},
-            "satisfaction_scores": {"thumbs_up": 0, "thumbs_down": 0}
-        }
-    
-    def generate_report(self, date: Optional[datetime.date] = None) -> Dict:
-        """Generate analytics report"""
-        if date is None:
-            date = datetime.date.today()
-        
-        report = {
-            "date": date.isoformat(),
-            "total_queries": self._count_total_queries(date),
-            "auto_resolved": self._count_auto_resolved(date),
-            "escalated_tickets": self._count_escalated_tickets(date),
-            "category_breakdown": self._get_category_breakdown(date),
-            "language_distribution": self._get_language_distribution(date),
-            "channel_distribution": self._get_channel_distribution(date),
-            "top_queries": self._get_top_queries(date, limit=10),
-            "average_response_time": self._calculate_avg_response_time(date),
-            "satisfaction_score": self._calculate_satisfaction_score()
-        }
-        
-        return report
-    
-    def record_feedback(self, session_id: str, thumbs_up: bool):
-        """Record customer feedback"""
-        if thumbs_up:
-            self.analytics_data["satisfaction_scores"]["thumbs_up"] += 1
-        else:
-            self.analytics_data["satisfaction_scores"]["thumbs_down"] += 1
-    
-    def _count_total_queries(self, date: datetime.date) -> int:
-        """Count total queries for a date"""
-        # Simplified - in production, this would query a database
-        return 0
-    
-    def _count_auto_resolved(self, date: datetime.date) -> int:
-        """Count auto-resolved queries"""
-        return 0
-    
-    def _count_escalated_tickets(self, date: datetime.date) -> int:
-        """Count escalated tickets"""
-        return 0
-    
-    def _get_category_breakdown(self, date: datetime.date) -> Dict:
-        """Get query category breakdown"""
-        return {}
-    
-    def _get_language_distribution(self, date: datetime.date) -> Dict:
-        """Get language distribution"""
-        return {}
-    
-    def _get_channel_distribution(self, date: datetime.date) -> Dict:
-        """Get channel distribution"""
-        return {}
-    
-    def _get_top_queries(self, date: datetime.date, limit: int = 10) -> List[str]:
-        """Get top queries"""
-        return []
-    
-    def _calculate_avg_response_time(self, date: datetime.date) -> float:
-        """Calculate average response time"""
-        return 0.0
-    
-    def _calculate_satisfaction_score(self) -> float:
-        """Calculate satisfaction score"""
-        total = (self.analytics_data["satisfaction_scores"]["thumbs_up"] + 
-                self.analytics_data["satisfaction_scores"]["thumbs_down"])
-        
-        if total == 0:
-            return 0.0
-        
-        return (self.analytics_data["satisfation_scores"]["thumbs_up"] / total) * 100
-
-# ============================================================================
-# MAIN APPLICATION
-# ============================================================================
-
-class CustomerSupportAIApplication:
-    """Main application orchestrator"""
-    
-    def __init__(self):
-        # Initialize components
-        self.knowledge_base = KnowledgeBaseIngestor()
-        self.ai_generator = AIResponseGenerator(self.knowledge_base)
-        self.chat_agent = ChatSupportAgent(self.ai_generator)
-        self.whatsapp_agent = WhatsAppSupportAgent(self.ai_generator)
-        self.email_agent = EmailAutoResponder(self.ai_generator)
-        self.ticket_system = TicketManagementSystem()
-        self.dashboard = AnalyticsDashboard(
-            self.chat_agent, self.whatsapp_agent, 
-            self.email_agent, self.ticket_system
-        )
-        
-        logger.info("Customer Support AI Application initialized")
-    
-    def run_demo(self):
-        """Run a demonstration of the system"""
-        print("=" * 60)
-        print("CUSTOMER SUPPORT AI AGENT - DEMONSTRATION")
-        print("=" * 60)
-        
-        # 1. Ingest knowledge base
-        print("\n1. Knowledge Base Ingestion")
-        print("-" * 40)
-        
-        # Example FAQ ingestion
-        faqs = [
-            {"question": "What is the warranty period?", 
-             "answer": "Our products come with a 1-year warranty."},
-            {"question": "How can I book a service?", 
-             "answer": "Visit our website at example.com/service-booking."}
-        ]
-        
-        faq_chunks = self.knowledge_base.add_faq(faqs)
-        print(f"Ingested {len(faq_chunks)} FAQ entries")
-        
-        # 2. Process website chat
-        print("\n2. Website Chat Support")
-        print("-" * 40)
-        
-        chat_response = self.chat_agent.process_message(
-            session_id="demo_session_1",
-            message="What is the warranty period for your products?",
-            business_unit="Electronics"
-        )
-        
-        print(f"Query: {chat_response.get('message', '')}")
-        print(f"Response: {chat_response.get('response_text', '')}")
-        print(f"Confidence: {chat_response.get('confidence', 0):.2f}")
-        
-        # 3. Process WhatsApp message
-        print("\n3. WhatsApp Support (Hindi)")
-        print("-" * 40)
-        
-        whatsapp_response = self.whatsapp_agent.process_whatsapp_message(
-            from_number="+911234567890",
-            message="Warranty kitna hai?",
-            business_unit="Home Appliances"
-        )
-        
-        print(f"Query (Hindi): Warranty kitna hai?")
-        print(f"Response: {whatsapp_response.get('message', '')}")
-        
-        # 4. Process email
-        print("\n4. Email Auto-Responder")
-        print("-" * 40)
-        
-        email_response = self.email_agent.process_email(
-            from_email="customer@example.com",
-            subject="Service Booking Inquiry",
-            body="Hello, I would like to book a service for my AC unit.",
-            business_unit="AC Services"
-        )
-        
-        print(f"Email Subject: {email_response.get('subject', '')}")
-        print(f"Auto-response: {email_response.get('body', '')[:100]}...")
-        
-        # 5. Generate analytics report
-        print("\n5. Analytics Dashboard")
-        print("-" * 40)
-        
-        report = self.dashboard.generate_report()
-        print(f"Date: {report.get('date')}")
-        print(f"Total Queries: {report.get('total_queries')}")
-        print(f"Auto Resolved: {report.get('auto_resolved')}")
-        print(f"Escalated Tickets: {report.get('escalated_tickets')}")
-        
-        print("\n" + "=" * 60)
-        print("DEMONSTRATION COMPLETE")
-        print("=" * 60)
-
-# ============================================================================
-# WEB API (Django-like structure)
-# ============================================================================
-
-class SupportAPI:
-    """REST API for the support system"""
-    
-    def __init__(self, app: CustomerSupportAIApplication):
-        self.app = app
-    
-    def chat_endpoint(self, request: Dict) -> Dict:
-        """Handle chat requests"""
-        session_id = request.get("session_id", "default")
-        message = request.get("message", "")
-        business_unit = request.get("business_unit", "default")
-        
-        response = self.app.chat_agent.process_message(
-            session_id, message, business_unit
-        )
-        
-        return {
-            "status": "success",
-            "data": response,
-            "timestamp": datetime.datetime.now(pytz.UTC).isoformat()
-        }
-    
-    def whatsapp_endpoint(self, request: Dict) -> Dict:
-        """Handle WhatsApp webhook requests"""
-        from_number = request.get("from")
-        message = request.get("message")
-        business_unit = request.get("business_unit", "default")
-        
-        response = self.app.whatsapp_agent.process_whatsapp_message(
-            from_number, message, business_unit
-        )
-        
-        return {
-            "status": "success",
-            "data": response,
-            "timestamp": datetime.datetime.now(pytz.UTC).isoformat()
-        }
-    
-    def email_endpoint(self, request: Dict) -> Dict:
-        """Handle email processing"""
-        from_email = request.get("from")
-        subject = request.get("subject", "")
-        body = request.get("body", "")
-        business_unit = request.get("business_unit", "default")
-        
-        response = self.app.email_agent.process_email(
-            from_email, subject, body, business_unit
-        )
-        
-        return {
-            "status": "success",
-            "data": response,
-            "timestamp": datetime.datetime.now(pytz.UTC).isoformat()
-        }
-    
-    def analytics_endpoint(self, request: Dict) -> Dict:
-        """Get analytics data"""
-        date_str = request.get("date")
-        date = None
-        
-        if date_str:
-            date = datetime.datetime.fromisoformat(date_str).date()
-        
-        report = self.app.dashboard.generate_report(date)
-        
-        return {
-            "status": "success",
-            "data": report,
-            "timestamp": datetime.datetime.now(pytz.UTC).isoformat()
-        }
-
-# ============================================================================
-# DEPLOYMENT AND MAIN EXECUTION
-# ============================================================================
-
-def main():
-    """Main entry point"""
-    # Initialize the application
-    app = CustomerSupportAIApplication()
-    
-    # Run demonstration
-    app.run_demo()
-    
-    # Initialize API
-    api = SupportAPI(app)
-    
-    print("\n\nAPI Endpoints Available:")
-    print("- /api/chat - For website chat")
-    print("- /api/whatsapp - For WhatsApp integration")
-    print("- /api/email - For email processing")
-    print("- /api/analytics - For dashboard data")
-    
-    return app
-
-if __name__ == "__main__":
-    main()
+    if st.button("🗑️ Clear All Data"):
+        if st.button("⚠️ Confirm Clear", type="primary"):
+            st.session_state.chat_history = []
+            st.session_state.tickets = []
+            st.session_state.analytics = {
+                'total_queries': 0,
+                'answered': 0,
+                'escalated': 0,
+                'languages': {'English': 0, 'Hindi': 0, 'Marathi': 0, 'Other': 0},
+                'categories': {'Billing': 0, 'Technical': 0, 'General': 0}
+            }
+            st.session_state.feedback = {}
+            
+            # Clear database
+            conn = st.session_state.db_conn
+            c = conn.cursor()
+            c.execute("DELETE FROM chat_history")
+            c.execute("DELETE FROM tickets")
+            c.execute("DELETE FROM feedback")
+            c.execute("DELETE FROM analytics")
+            conn.commit()
+            
+            st.success("All data cleared!")
+            st.rerun()
