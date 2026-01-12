@@ -13,12 +13,14 @@ import re
 from io import BytesIO
 import base64
 
-# For PDF/DOCX processing
+# For PDF/DOCX/Excel processing
 try:
     import PyPDF2
     from docx import Document
+    import openpyxl
+    from openpyxl import load_workbook
 except ImportError:
-    st.warning("Please install: pip install PyPDF2 python-docx")
+    st.warning("Please install: pip install PyPDF2 python-docx openpyxl")
 
 # For vector database and embeddings
 try:
