@@ -1,39 +1,42 @@
 # Core Framework
 streamlit
 
-# Data Processing & Visualization
+# Data Processing
 pandas
-plotly
 numpy
 
-# PDF/DOCX/Excel Processing
+# Visualization
+plotly
+
+# Document Processing
 PyPDF2
 python-docx
 openpyxl
 
-# AI & LangChain
+# Email Support
+# Built-in Python libraries (smtplib, imaplib, email) - no installation needed
+
+# AI & NLP (Optional - for advanced features)
 langchain
 langchain-openai
 langchain-community
+faiss-cpu
 openai
 
-# Vector Database
-faiss-cpu
-
-# Language Detection & Translation
+# Language Support
 langdetect
 deep-translator
 
-# Web Scraping
+# Web Scraping (Optional)
 requests
 beautifulsoup4
 
-# OCR (Optical Character Recognition)
+# OCR Support (Optional)
 pytesseract
 Pillow
 
-# Machine Learning (for confidence scoring)
+# Machine Learning (Optional)
 scikit-learn
 
-# Database (comes with Python, but listing for clarity)
-# sqlite3 (built-in with Python)
+# Database
+# sqlite3 is built-in with Python - no installation needed
